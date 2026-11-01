@@ -120,3 +120,65 @@ The shader also contains commented code to switch to a triangle view to see if L
 ## License
 
 See [LICENSE.md](LICENSE.md).
+
+## 修改文档
+
+### 2026.11.01
+
+#### 配Vulkan
+
+Player Settings → Other Settings → Graphics APIs 只留 Vulkan，删掉 D3D12/D3D11。Active Build Target = Windows。
+原因：README L85-86 明确写了烘焙对当前 active build target 打 AB，而运行期第 0 帧就要 AssetBundle.LoadFromFile。另外 DrawProceduralIndirect + GraphicsBuffer.Target.Index + startIndex 这套在 DX12 下有已知问题（README L22 自己列了）。
+
+#### Stage 0 测试场景
+
+目标：不动 OasisScene，先用 Tent_01_Prefab + Teleporter_Platform_01_Prefab 两个 prefab 验证 `ShaderGraph → *_VMESH.shader → 出图` 这条链路。Oasis 的材质几乎全是 ShaderGraph，这条链路不通的话整个场景烘出来就是空的。
+MCP（unity）一开始能读到活动场景 OasisScene / Edit 模式，但 `create_scene` 超时后所有调用（`get_scene_info`、`get_play_mode_status`）都超时，判断 Unity 主线程被阻塞（大概率弹了"保存场景"模态框）；已核对磁盘，`Assets/Scenes/Oasis/` 下没有生成 `VMeshTest_00_ShaderGraph.unity`，无半成品。
+改用不依赖 MCP 的确定性方案：新增 [Editor/VMeshStage0Builder.cs](Editor/VMeshStage0Builder.cs)，菜单 `Virtual Mesh / Tests / Build Stage 0 Scene` 一键建场景、建 VMRoot、实例化两个 prefab、给主相机挂 VirtualMeshManager 并回填 `m_CopyPassesShader` / `m_PlaceholderMaterial`、把 `m_CameraLoadDistanceThreshold` 设为 300，然后保存。脚本用 `SerializedObject` 写字段而不是调用 `CameraLoadDistanceThreshold` 属性——该属性 setter 会写 `m_PageStrideConstants`，而它只在运行时 `AllocateData()` 里创建，编辑器里调用会抛 NullReferenceException。
+待办：① 执行该菜单；② 手动把 VirtualMeshRenderFeature 加到当前 Quality Level 用的 Renderer Data，Render Mode 与该 renderer 的 Rendering Path 一致；③ `Bake Shaders Only` 后检查 `Assets/VirtualMeshCache/Shaders/Tent_Graph_VMESH.shader` 是否包含 `com.unity.virtualmesh/Runtime/ShaderLibrary/PBRForwardPass.hlsl`，不含即说明 ShaderGraph 的 include 替换没命中，先修 `VirtualMeshBakerAPI.ConvertShaders` 的替换表再往下走。
+
+关闭保存弹窗后重试：`execute_menu_item` 一开始报"菜单项不存在"，原因是新加的 .cs 还没被 AssetDatabase 导入（磁盘上没有 `.meta`）；执行 `Assets/Refresh` 后生成 meta，再 `recompile_scripts` 才注册成功（0 error）。最终菜单执行成功，场景已生成并保存，校验通过：`VMRoot` 下 `Tent_01` + `Teleporter_Platform_01` 两个 prefab 实例；`Main Camera` 上 `VirtualMeshManager` 的 `m_CopyPassesShader`、`m_PlaceholderMaterial`、`m_CameraLoadDistanceThreshold: 300` 三个字段都已持久化进场景文件。
+
+过程中发现并修掉一个问题：`m_CameraLoadDistanceThreshold` 原本**没有 `[SerializeField]`**，所以 implementation.md 说它"可调"是错的——既不能在 Inspector 里改，也无法持久化，每次 domain reload 都回到 20。已给该字段补上 `[SerializeField]` 并在注释里说明。同时更正一处先前的误判：Oasis 的 prefab **是有 LODGroup 的**（`Tent_01_Mesh`、`Teleporter_Platform_01_Mesh` 上都带），之前只 grep 场景 YAML 得出"0 个 LODGroup"是错的——LODGroup 在 prefab 内，场景文件只存 PrefabInstance 的覆盖值。
+
+② `VirtualMeshRenderFeature` 加到 当前URP管线的RendererFeature；③ `Bake Shaders Only` → 检查 `Tent_Graph_VMESH.shader` 的 include 是否被替换成 `Packages/com.unity.virtualmesh/Runtime/ShaderLibrary/PBRForwardPass.hlsl`。
+
+#### Stage 0 Full Bake 结果（2 个物体）
+
+Console 统计：`Serialized 389 instances into 1 pages (min: 0, max: 389) from 3 submeshes (degenerative cluster ratio: 0.0925, average leaf cluster ratio: 0.15, max vertex values: 21428, max index values: 23884, max group count: 55, material count: 3)`。
+解读：389 = 所有 LOD 层的 cluster 总数，`max group count 55` = 55 个 cluster group；只填了 1 页（远低于 256 上限）；3 个 submesh、3 个唯一材质；9.25% 的 cluster 不满 64 三角形属正常。**`max index values: 23884` ≈ 页内三角形数**，实证了审计报告 P1-04 的前提——`IndexValuePageStride` 的单位是「三角形」而不是「索引值」。
+
+#### ShaderGraph 转换验证通过
+
+生成了 `Assets/VirtualMeshCache/Shaders/Tent_Graph_VMESH.shader` 与 `Lit_VMESH.shader`，6 个 PBR include 全部替换成功（`PBRForwardPass` L639、`PBRGBufferPass` L1253、`PBRShadowCasterPass` L1577、`PBRDepthOnlyPass` L2200、`PBRDepthNormalsOnlyPass` L2555、`PBR2DPass` L4047）；`Lit_VMESH.shader` 的 6 个 Lit*Pass 同样全部替换。
+更关键的是确认了这是**真替换**而不是只改路径——6 个 PBR pass 的顶点入口都变成了 VMESH 版本 `PackedVaryings vert(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)`（行号 80/76/6/6/6/3）。残留的 `Editor/ShaderGraph/Includes/*` 只剩 `ShaderPass.hlsl`、`Varyings.hlsl`（必需）加 MotionVector/Meta/SelectionPicking（本来就不在替换表内），属预期。
+结论：**ShaderGraph 17.6 的生成格式与 `ConvertShaders` 的替换表完全匹配**，这条最脆的链路通了。
+
+#### 输出资源路径
+
+运行期数据在 `Assets/StreamingAssets/VirtualMeshData/`：`metadata.vmesh`（全局元数据）、`NNNNNNNN.vmesh` × 256（每页 7 个 uint 的页头）、`NNNNNNNN.vmeshdata` × 256（页数据）、`Materials/virtualmeshmaterials`(+manifest)、`Placeholders/virtualmeshplaceholders`(+manifest) 两个 AssetBundle。注意 256 个页文件是**无条件全写**（`WriteFiles` 循环 0..255），只有第 1 页有内容，其余是 0 字节空壳——by design，不是 bug。
+中间产物在 `Assets/VirtualMeshCache/`：`Shaders/`（2 个，关键诊断物）、`Materials/`（`0/1/2.mat` + `MaterialCollection.asset`）、`Meshes/`（256 个页级占位 Mesh + `MeshCollection.asset`）、`Obj/`（`k_ExportOBJ = false`，空）。
+
+#### 渲染链路确认
+
+`m_CurrentQuality: 3` → PC High → `PC_High.asset`(guid `4b83569d…`) → `m_RendererDataList[0]` = `PC_High_Renderer.asset`(guid `f288ae1f…`)，`VirtualMeshRenderFeature` 已挂在该资产上（`m_Active: 1`，5 个资源引用全部自动回填），相机 `actualRenderingPath = Forward`。整条链是通的。
+一个语义陷阱：该 feature 的 `renderMode` 序列化值是 **3**，而代码只在 `== RenderingPath.DeferredShading`(=2) 时才走 GBuffer 分支，值 3 会落到 else 分支（用 `cameraColor + cameraDepth`）——对当前 Forward 路径**恰好正确**，但将来切 Deferred 必须把这个值明确改成 `DeferredShading`，否则会静默走 Forward 分支。见 `VirtualMeshRenderFeature.cs:343,607`。
+
+#### 内存：约 30 倍超额分配
+
+Stage 0 实际几何约 1.2 万三角形 / 0.6 MB，但 GPU 缓冲按「页步长 × 可加载页数」分配：VertexPosition ≈2.6 MB、VertexAttribute ≈5.2 MB、Index ≈2.9 MB、CompactedIndex ≈6–15 MB（随 cascade 数），合计 **约 19–28 MB**。原因见 `VirtualMeshManager.cs:1001-1041`——`m_LoadableMemoryPageCount` 只按页数向上取整钳到 32，完全不知道真实内容量。Stage 0 无所谓，加内容时需关注。
+
+#### 流式淘汰的门槛（重要）
+
+页数会先向上取整到 32/64/128/256，然后 `if (m_MemoryPageCount < m_LoadableMemoryPageCount) m_LoadableMemoryPageCount = m_MemoryPageCount;`（`VirtualMeshManager.cs:794-806`）。推论：页数 1–32 → 槽位 32；33–64 → 64；65–128 → 128，三种情况槽位都 ≥ 页数，**永远不会换出**；只有 **>128 页**（约 400–800 万三角形）才会触发页淘汰。也就是说 5 态机里的 `Waiting`/`TooFar`/`Loading` 淘汰路径在 Stage 0/1/2 都跑不到，要验证虚拟内存分页必须直接上万级页数或全 Oasis。
+
+#### LOD 验证场景 + 统计 HUD
+
+新增 [Runtime/VMeshStats.cs](Runtime/VMeshStats.cs)（纯新增，`Unity.VirtualMesh.Runtime` 命名空间，`AddComponentMenu("Virtual Mesh/VMesh Stats HUD")`），挂到主相机。每 `SampleInterval`(默认 15) 帧用 `AsyncGPUReadback` 读回两个缓冲：`DrawArgsBuffer` 每材质的 `indexCount/3` 求和得到**本帧真正提交的三角形数**，`DispatchArgsBuffer[0]` 得到通过 cluster 级剔除的 cluster 数；连同材质数、页数、cluster 容量一起画在 y=78/108（避开 `VirtualMeshManager.OnGUI` 在 y=10/40 的页状态显示）。这是"剔除是否真的生效"的硬指标。
+
+场景侧把 `Tent_01` 复制 8 份为 `Tent_01_D1..D8`，x 固定 -5，z = 20/45/75/110/155/210/280/360（距相机 22–382 m），形成一条纵深序列用于观察 LOD 阶梯。复制件保留原 Renderer 的启用状态**不影响烘焙**——`GetFilterList` 是按 GameObject 的 active 状态取 `MeshFilter`，不检查 Renderer 组件是否 enabled。
+另外，10 个帐篷的 LOD 子物体同名（都叫 `Tent_01_LOD0/1/2`），`GetFilterList` 第二段循环是按**名字**判断过滤器是否已归属某个 LODGroup，因此这些过滤器会被全部跳过——但第一段循环已经从每个 LODGroup 取到了 LOD0，最终仍是 11 个 submesh，**结果正确**。这正是审计报告里"按名字匹配"脆弱点在当前内容下的巧合性成立。
+
+#### 阶段总结
+
+1.这个包只是把场景烘焙出nanite数据放到StreamingAssets验证流程的，离落地差太远。需要改成按照mesh烘焙VM数据，场景中可拖放，BRG绘制等操作。

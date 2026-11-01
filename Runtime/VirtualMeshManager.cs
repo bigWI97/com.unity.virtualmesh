@@ -151,6 +151,11 @@ namespace Unity.VirtualMesh.Runtime
         private int m_PingPongBufferIndex = 0;
         private int m_ShadowCacadeCount = 1;
 
+        // NOTE (local change): this field had no [SerializeField], so despite Documentation~/implementation.md
+        // describing it as tunable it could not be set in the Inspector and reset to 20 on every domain reload.
+        // Serializing it makes the value persistent. The CameraLoadDistanceThreshold property still writes the
+        // constant buffer for runtime changes, but only after AllocateData() has created m_PageStrideConstants.
+        [SerializeField]
         private float m_CameraLoadDistanceThreshold = 20.0f;
 
         private AssetBundle m_MaterialAssetBundle = null;
