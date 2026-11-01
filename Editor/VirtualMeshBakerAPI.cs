@@ -212,7 +212,11 @@ namespace Unity.VirtualMesh.Editor
                     if (!CheckSupportedShader(material.shader, bakeOpaqueObjectsOnly))
                         continue;
 
+#if UNITY_6000_5_OR_NEWER
+                    int materialIndex = materials.FindIndex(x => material.GetEntityId().Equals(x.GetEntityId()));
+#else
                     int materialIndex = materials.FindIndex(x => material.GetInstanceID().Equals(x.GetInstanceID()));
+#endif
                     if (materialIndex == -1)
                     {
                         materialIndex = materials.Count;
@@ -395,7 +399,11 @@ namespace Unity.VirtualMesh.Editor
                         continue;
 
                     // identify material
+#if UNITY_6000_5_OR_NEWER
+                    int materialIndex = materials.FindIndex(x => material.GetEntityId().Equals(x.GetEntityId()));        
+#else
                     int materialIndex = materials.FindIndex(x => material.GetInstanceID().Equals(x.GetInstanceID()));
+#endif
                     if (materialIndex == -1)
                     {
                         materialIndex = materials.Count;
